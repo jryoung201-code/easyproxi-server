@@ -200,10 +200,6 @@ function renderConsoleHtml(req) {
 </html>`;
 }
 
-function escapeHtml(text) {
-  return String(text).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
-}
-
 app.use((req, res, next) => {
   req.clientIp = getClientIp(req);
   req.clientUser = getOrCreateUser(req.clientIp);
