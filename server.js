@@ -4,18 +4,26 @@ import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { load as cheerioLoad } from 'cheerio';
+import bcrypt from 'bcrypt';
+import session from 'express-session';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const MAX_DATA_MB = 100 * 1024; // 100 GB in megabytes
 const SERVER_START = Date.now();
-const USERS_FILE = path.resolve('users.json');
+const USERS_FILE = path.resolve('accounts.json');
 
 app.use(cors());
+app.use(session({
+  secret: 'easyproxi-secret-key-change-this-in-production',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false } // set to true if using https
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
-// --- IP-based user store ---
+// --- User accounts store ---
 function loadUsersFromFile() {
   try {
     const raw = fs.readFileSync(USERS_FILE, 'utf-8');
@@ -23,7 +31,7 @@ function loadUsersFromFile() {
     return new Map(Object.entries(data));
   } catch (err) {
     if (err.code && err.code !== 'ENOENT') {
-      console.error('[users] failed to load users.json', err);
+      console.error('[accounts] failed to load accounts.json', err);
     }
     return new Map();
   }
@@ -34,44 +42,48 @@ function saveUsersToFile() {
     const data = Object.fromEntries(users.entries());
     fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[users] failed to save users.json', err);
+    console.error('[accounts] failed to save accounts.json', err);
   }
+}
+
+function getUser(username) {
+  return users.get(username);
+}
+
+function createUser(username, password) {
+  const hash = bcrypt.hashSync(password, 10);
+  const user = {
+    username,
+    passwordHash: hash,
+    dataUsed: 0,
+    dataLimit: MAX_DATA_MB,
+    requests: 0,
+    createdAt: new Date().toISOString(),
+    lastSeen: new Date().toISOString()
+  };
+  users.set(username, user);
+  saveUsersToFile();
+  return user;
+}
+
+function authenticateUser(username, password) {
+  const user = users.get(username);
+  if (!user) return null;
+  if (bcrypt.compareSync(password, user.passwordHash)) {
+    user.lastSeen = new Date().toISOString();
+    saveUsersToFile();
+    return user;
+  }
+  return null;
 }
 
 const users = loadUsersFromFile();
 
-function getClientIp(req) {
-  return (
-    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
-    req.socket.remoteAddress ||
-    'unknown'
-  );
-}
-
-function getOrCreateUser(ip) {
-  let user = users.get(ip);
-  if (!user) {
-    const rand = () => randomBytes(3).toString('hex').toUpperCase();
-    user = {
-      ip,
-      apiKey: `EPX-${rand()}-${rand()}-${rand()}`,
-      dataUsed: 0,
-      dataLimit: MAX_DATA_MB,
-      requests: 0,
-      createdAt: new Date().toISOString(),
-      lastSeen: new Date().toISOString(),
-    };
-    users.set(ip, user);
-    saveUsersToFile();
-    return user;
+function requireAuth(req, res, next) {
+  if (!req.session.user) {
+    return res.redirect('/login');
   }
-
-  if (user.dataLimit == null) {
-    user.dataLimit = MAX_DATA_MB;
-  }
-  user.lastSeen = new Date().toISOString();
-  saveUsersToFile();
-  return user;
+  next();
 }
 
 function getServerUptime() {
@@ -199,12 +211,6 @@ function renderConsoleHtml(req) {
 </body>
 </html>`;
 }
-
-app.use((req, res, next) => {
-  req.clientIp = getClientIp(req);
-  req.clientUser = getOrCreateUser(req.clientIp);
-  next();
-});
 
 // --- URL rewriting ---
 const PROXY_PATH = '/api/proxy?url=';
@@ -649,10 +655,10 @@ app.get('/api/status', (req, res) => {
 });
 
 // --- GET /api/me ---
-app.get('/api/me', (req, res) => {
-  const user = req.clientUser;
+app.get('/api/me', requireAuth, (req, res) => {
+  const user = getUser(req.session.user);
   res.json({
-    apiKey: user.apiKey,
+    username: user.username,
     dataUsed: user.dataUsed,
     dataLimit: user.dataLimit || MAX_DATA_MB,
     requests: user.requests,
@@ -664,18 +670,18 @@ app.get('/api/me', (req, res) => {
 });
 
 // --- POST /api/reset ---
-app.post('/api/reset', (req, res) => {
-  const user = req.clientUser;
+app.post('/api/reset', requireAuth, (req, res) => {
+  const user = getUser(req.session.user);
   user.dataUsed = 0;
   user.requests = 0;
   saveUsersToFile();
-  console.log(`[reset] ip=${req.clientIp}`);
+  console.log(`[reset] user=${req.session.user}`);
   res.json({ success: true });
 });
 
 // --- POST /api/usage (legacy) ---
-app.post('/api/usage', (req, res) => {
-  const user = req.clientUser;
+app.post('/api/usage', requireAuth, (req, res) => {
+  const user = getUser(req.session.user);
   const { dataUsed, requests } = req.body;
   user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + (parseFloat(dataUsed) || 0));
   user.requests += parseInt(requests) || 0;
@@ -684,11 +690,11 @@ app.post('/api/usage', (req, res) => {
 });
 
 // --- GET /api/proxy?url=... ---
-app.get('/api/proxy', async (req, res) => {
+app.get('/api/proxy', requireAuth, async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Missing URL');
 
-  const user = req.clientUser;
+  const user = getUser(req.session.user);
 
   try {
     const response = await fetch(url, {
