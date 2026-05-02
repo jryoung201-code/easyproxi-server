@@ -110,15 +110,14 @@ function renderConsoleHtml(req) {
   const userRows = Array.from(users.values())
     .map(user => `
       <tr>
-        <td>${escapeHtml(user.ip)}</td>
-        <td>${escapeHtml(user.apiKey)}</td>
+        <td>${escapeHtml(user.username)}</td>
         <td>${escapeHtml(user.dataUsed.toFixed ? user.dataUsed.toFixed(2) : user.dataUsed)}</td>
         <td>${escapeHtml(user.dataLimit || dataLimit)}</td>
         <td>${escapeHtml(user.requests)}</td>
         <td>${escapeHtml(user.createdAt)}</td>
         <td>${escapeHtml(user.lastSeen)}</td>
       </tr>`)
-    .join('') || '<tr><td colspan="7">No users yet</td></tr>';
+    .join('') || '<tr><td colspan="6">No users yet</td></tr>';
 
   return `<!doctype html>
 <html lang="en">
@@ -166,9 +165,11 @@ function renderConsoleHtml(req) {
         <div class="section">
           <h1>EasyProxi Console</h1>
           <p class="small">Linux-style monitoring view for proxy users and limits.</p>
+          <p>Logged in as: ${escapeHtml(req.session.user)}</p>
           ${msg}
           <div class="toolbar">
             <button class="button" onclick="location.reload()">refresh</button>
+            <form method="POST" action="/logout" style="display:inline;"><button type="submit" class="button">logout</button></form>
           </div>
         </div>
         <div class="stats">
@@ -184,8 +185,7 @@ function renderConsoleHtml(req) {
       <table>
         <thead>
           <tr>
-            <th>IP</th>
-            <th>API Key</th>
+            <th>Username</th>
             <th>Used MB</th>
             <th>Limit MB</th>
             <th>Requests</th>
@@ -206,7 +206,7 @@ function renderConsoleHtml(req) {
       <input type="text" name="command" placeholder="Enter command..." style="background: #15261c; border: 1px solid rgba(135, 211, 124, .12); color: #c7f0a6; border-radius: 8px; padding: 10px; width: 100%; font-family: inherit;">
       <button type="submit" class="button">Execute</button>
     </form>
-    <p class="small">Commands: list, add &lt;ip&gt; &lt;limit&gt;, set &lt;ip&gt; limit &lt;limit&gt;, delete &lt;ip&gt;, reset &lt;ip&gt;</p>
+    <p class="small">Commands: list, add &lt;username&gt; &lt;password&gt; &lt;limit&gt;, set &lt;username&gt; limit &lt;limit&gt;, delete &lt;username&gt;, reset &lt;username&gt;</p>
   </div>
 </body>
 </html>`;
@@ -770,12 +770,12 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
 });
 
 // --- Console HTML ---
-app.get('/console', (req, res) => {
+app.get('/console', requireAuth, (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(renderConsoleHtml(req));
 });
 
-app.post('/console', (req, res) => {
+app.post('/console', requireAuth, (req, res) => {
   const cmd = req.body.command?.trim();
   if (!cmd) return res.redirect('/console?msg=Empty command');
   const parts = cmd.split(/\s+/);
@@ -784,44 +784,116 @@ app.post('/console', (req, res) => {
   try {
     if (action === 'list') {
       msg = 'Users listed above';
-    } else if (action === 'add' && parts.length >= 3) {
-      const ip = parts[1];
-      const limit = parseInt(parts[2]);
-      if (!ip || isNaN(limit)) throw new Error('Invalid IP or limit');
-      const user = getOrCreateUser(ip);
+    } else if (action === 'add' && parts.length >= 4) {
+      const username = parts[1];
+      const password = parts[2];
+      const limit = parseInt(parts[3]);
+      if (!username || !password || isNaN(limit)) throw new Error('Invalid username, password or limit');
+      if (users.has(username)) throw new Error('User already exists');
+      const user = createUser(username, password);
       user.dataLimit = limit;
       saveUsersToFile();
-      msg = `User ${ip} added/updated with limit ${limit} MB`;
+      msg = `User ${username} added with limit ${limit} MB`;
     } else if (action === 'set' && parts[1] && parts[2] === 'limit' && parts.length >= 4) {
-      const ip = parts[1];
+      const username = parts[1];
       const limit = parseInt(parts[3]);
-      const user = users.get(ip);
+      const user = users.get(username);
       if (!user) throw new Error('User not found');
       user.dataLimit = limit;
       saveUsersToFile();
-      msg = `Limit for ${ip} set to ${limit} MB`;
+      msg = `Limit for ${username} set to ${limit} MB`;
     } else if (action === 'delete' && parts.length >= 2) {
-      const ip = parts[1];
-      if (users.delete(ip)) {
+      const username = parts[1];
+      if (users.delete(username)) {
         saveUsersToFile();
-        msg = `User ${ip} deleted`;
+        msg = `User ${username} deleted`;
       } else {
-        msg = `User ${ip} not found`;
+        msg = `User ${username} not found`;
       }
     } else if (action === 'reset' && parts.length >= 2) {
-      const ip = parts[1];
-      const user = users.get(ip);
+      const username = parts[1];
+      const user = users.get(username);
       if (!user) throw new Error('User not found');
       user.dataUsed = 0;
       saveUsersToFile();
-      msg = `Data usage for ${ip} reset to 0`;
+      msg = `Data usage for ${username} reset to 0`;
     } else {
-      throw new Error('Unknown command. Use: list, add <ip> <limit>, set <ip> limit <limit>, delete <ip>, reset <ip>');
+      throw new Error('Unknown command. Use: list, add <username> <limit>, set <username> limit <limit>, delete <username>, reset <username>');
     }
   } catch (e) {
     msg = 'Error: ' + e.message;
   }
   res.redirect('/console?msg=' + encodeURIComponent(msg));
+});
+
+// --- Auth routes ---
+app.get('/register', (req, res) => {
+  if (req.session.user) return res.redirect('/console');
+  res.send(`
+    <!doctype html>
+    <html>
+    <head><title>Register</title></head>
+    <body>
+      <h1>Register</h1>
+      <form method="POST" action="/register">
+        <input name="username" placeholder="Username" required><br>
+        <input name="password" type="password" placeholder="Password" required><br>
+        <button type="submit">Register</button>
+      </form>
+      <a href="/login">Login</a>
+    </body>
+    </html>
+  `);
+});
+
+app.post('/register', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.send('Missing fields');
+  if (users.has(username)) return res.send('User exists');
+  createUser(username, password);
+  req.session.user = username;
+  res.redirect('/console');
+});
+
+app.get('/login', (req, res) => {
+  if (req.session.user) return res.redirect('/console');
+  res.send(`
+    <!doctype html>
+    <html>
+    <head><title>Login</title></head>
+    <body>
+      <h1>Login</h1>
+      <form method="POST" action="/login">
+        <input name="username" placeholder="Username" required><br>
+        <input name="password" type="password" placeholder="Password" required><br>
+        <button type="submit">Login</button>
+      </form>
+      <a href="/register">Register</a>
+    </body>
+    </html>
+  `);
+});
+
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  const user = authenticateUser(username, password);
+  if (!user) return res.send('Invalid credentials');
+  req.session.user = username;
+  res.redirect('/console');
+});
+
+app.post('/logout', (req, res) => {
+  req.session.destroy();
+  res.redirect('/login');
+});
+
+// --- Root redirect ---
+app.get('/', (req, res) => {
+  if (req.session.user) {
+    res.redirect('/console');
+  } else {
+    res.redirect('/login');
+  }
 });
 
 // --- Root ---
