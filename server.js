@@ -3,7 +3,7 @@ import cors from 'cors';
 import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import cheerio from 'cheerio';
+import { load as cheerioLoad } from 'cheerio';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -350,7 +350,7 @@ function getNavigationOverrideScript(pageUrl) {
 function rewriteHtml(html, baseUrl) {
   const doctypeMatch = html.match(/^\s*<!doctype[^>]*>/i);
   const doctype = doctypeMatch ? doctypeMatch[0] : '';
-  const $ = cheerio.load(html, { decodeEntities: false, lowerCaseAttributeNames: false });
+  const $ = cheerioLoad(html, { decodeEntities: false, lowerCaseAttributeNames: false });
   const baseHref = $('base[href]').first().attr('href');
   const pageBase = resolveUrl(baseUrl, baseHref || '') || baseUrl;
 
