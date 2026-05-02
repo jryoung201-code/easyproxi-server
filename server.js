@@ -1,17 +1,44 @@
 import express from 'express';
 import cors from 'cors';
 import { randomBytes } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import cheerio from 'cheerio';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MAX_DATA_MB = 500;
+const MAX_DATA_MB = 100 * 1024; // 100 GB in megabytes
 const SERVER_START = Date.now();
+const USERS_FILE = path.resolve('users.json');
 
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
 // --- IP-based user store ---
-const users = new Map();
+function loadUsersFromFile() {
+  try {
+    const raw = fs.readFileSync(USERS_FILE, 'utf-8');
+    const data = JSON.parse(raw);
+    return new Map(Object.entries(data));
+  } catch (err) {
+    if (err.code && err.code !== 'ENOENT') {
+      console.error('[users] failed to load users.json', err);
+    }
+    return new Map();
+  }
+}
+
+function saveUsersToFile() {
+  try {
+    const data = Object.fromEntries(users.entries());
+    fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[users] failed to save users.json', err);
+  }
+}
+
+const users = loadUsersFromFile();
 
 function getClientIp(req) {
   return (
@@ -22,19 +49,28 @@ function getClientIp(req) {
 }
 
 function getOrCreateUser(ip) {
-  if (!users.has(ip)) {
+  let user = users.get(ip);
+  if (!user) {
     const rand = () => randomBytes(3).toString('hex').toUpperCase();
-    users.set(ip, {
+    user = {
       ip,
       apiKey: `EPX-${rand()}-${rand()}-${rand()}`,
       dataUsed: 0,
+      dataLimit: MAX_DATA_MB,
       requests: 0,
       createdAt: new Date().toISOString(),
       lastSeen: new Date().toISOString(),
-    });
+    };
+    users.set(ip, user);
+    saveUsersToFile();
+    return user;
   }
-  const user = users.get(ip);
+
+  if (user.dataLimit == null) {
+    user.dataLimit = MAX_DATA_MB;
+  }
   user.lastSeen = new Date().toISOString();
+  saveUsersToFile();
   return user;
 }
 
@@ -53,8 +89,7 @@ app.use((req, res, next) => {
 });
 
 // --- URL rewriting ---
-// Rewrites all URLs in HTML/CSS so they route through the proxy
-const PROXY_BASE = 'https://server.easyproxi.online/api/proxy?url=';
+const PROXY_PATH = '/api/proxy?url=';
 
 function resolveUrl(base, relative) {
   try {
@@ -64,82 +99,234 @@ function resolveUrl(base, relative) {
   }
 }
 
+function isSkipUrl(url) {
+  if (!url) return true;
+  const trimmed = url.trim();
+  return (
+    trimmed.startsWith('data:') ||
+    trimmed.startsWith('blob:') ||
+    trimmed.startsWith('javascript:') ||
+    trimmed.startsWith('#') ||
+    trimmed.startsWith('mailto:') ||
+    trimmed.startsWith('tel:')
+  );
+}
+
+function isAlreadyProxied(resolved) {
+  return resolved.includes(PROXY_PATH);
+}
+
 function rewriteUrl(url, baseUrl) {
   if (!url) return url;
-  url = url.trim();
-  if (
-    url.startsWith('data:') ||
-    url.startsWith('blob:') ||
-    url.startsWith('javascript:') ||
-    url.startsWith('#') ||
-    url.startsWith('mailto:') ||
-    url.startsWith('tel:')
-  ) return url;
-
+  if (isSkipUrl(url)) return url;
   const resolved = resolveUrl(baseUrl, url);
   if (!resolved) return url;
+  if (isAlreadyProxied(resolved)) return url;
+  return PROXY_PATH + encodeURIComponent(resolved);
+}
 
-  // Don't re-proxy already proxied URLs
-  if (resolved.startsWith('https://server.easyproxi.online')) return url;
+function rewriteActionUrl(url, baseUrl) {
+  const resolved = resolveUrl(baseUrl, url || '') || baseUrl;
+  if (!resolved) return url || baseUrl;
+  if (isAlreadyProxied(resolved)) return url || baseUrl;
+  return PROXY_PATH + encodeURIComponent(resolved);
+}
 
-  return PROXY_BASE + encodeURIComponent(resolved);
+function rewriteSrcset(srcset, baseUrl) {
+  return srcset.replace(/(\S+)(\s+\S+)?/g, (part, url, descriptor) => {
+    return rewriteUrl(url, baseUrl) + (descriptor || '');
+  });
+}
+
+function rewriteStyleUrls(css, baseUrl) {
+  return css.replace(/url\(["']?([^\)"']+)["']?\)/gi, (match, url) => {
+    return `url("${rewriteUrl(url, baseUrl)}")`;
+  });
+}
+
+function getNavigationOverrideScript(pageUrl) {
+  return `(function() {
+  const proxyPrefix = '${PROXY_PATH}';
+  const originalPageUrl = ${JSON.stringify(pageUrl)};
+
+  function isProxyTarget(url) {
+    try {
+      const resolved = new URL(url, originalPageUrl).href;
+      return resolved.includes(proxyPrefix) || resolved.startsWith(window.location.origin + proxyPrefix);
+    } catch {
+      return false;
+    }
+  }
+
+  function resolveTargetUrl(url) {
+    try {
+      return new URL(url, originalPageUrl).href;
+    } catch {
+      return url;
+    }
+  }
+
+  function proxyUrl(url) {
+    if (!url) return url;
+    const trimmed = String(url).trim();
+    if (trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('javascript:') || trimmed.startsWith('mailto:') || trimmed.startsWith('tel:') || trimmed.startsWith('#')) {
+      return trimmed;
+    }
+    const resolved = resolveTargetUrl(trimmed);
+    if (isProxyTarget(resolved)) return resolved;
+    return proxyPrefix + encodeURIComponent(resolved);
+  }
+
+  const originalFetch = window.fetch.bind(window);
+  const originalOpen = window.open.bind(window);
+  const originalAssign = window.location.assign.bind(window.location);
+  const originalReplace = window.location.replace.bind(window.location);
+
+  window.fetch = function(resource, init) {
+    if (typeof resource === 'string') {
+      resource = proxyUrl(resource);
+    } else if (resource instanceof Request) {
+      resource = new Request(proxyUrl(resource.url), resource);
+    }
+    return originalFetch(resource, init);
+  };
+
+  window.open = function(url, target, features) {
+    return originalOpen(proxyUrl(url || originalPageUrl), target, features);
+  };
+
+  window.location.assign = function(url) {
+    return originalAssign(proxyUrl(url));
+  };
+
+  window.location.replace = function(url) {
+    return originalReplace(proxyUrl(url));
+  };
+
+  try {
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return location;
+      },
+      set(url) {
+        originalAssign(proxyUrl(url));
+      }
+    });
+    Object.defineProperty(document, 'location', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return location;
+      },
+      set(url) {
+        originalAssign(proxyUrl(url));
+      }
+    });
+  } catch (e) {
+    // Some browsers do not allow redefining location
+  }
+
+  const xhrProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+  if (xhrProto) {
+    const originalXhrOpen = xhrProto.open;
+    xhrProto.open = function(method, url) {
+      const args = Array.prototype.slice.call(arguments);
+      args[1] = proxyUrl(args[1]);
+      return originalXhrOpen.apply(this, args);
+    };
+  }
+})();`;
 }
 
 function rewriteHtml(html, baseUrl) {
-  // Rewrite href attributes (links, stylesheets)
-  html = html.replace(/\s(href)=["']([^"']+)["']/gi, (match, attr, url) => {
-    return ` ${attr}="${rewriteUrl(url, baseUrl)}"`;
+  const doctypeMatch = html.match(/^\s*<!doctype[^>]*>/i);
+  const doctype = doctypeMatch ? doctypeMatch[0] : '';
+  const $ = cheerio.load(html, { decodeEntities: false, lowerCaseAttributeNames: false });
+  const baseHref = $('base[href]').first().attr('href');
+  const pageBase = resolveUrl(baseUrl, baseHref || '') || baseUrl;
+
+  function rewriteAttr(el, attr, action = false) {
+    const current = $(el).attr(attr);
+    if (!current) return;
+    const rewritten = action ? rewriteActionUrl(current, pageBase) : rewriteUrl(current, pageBase);
+    if (rewritten) $(el).attr(attr, rewritten);
+  }
+
+  $('[href]').each((i, el) => {
+    if (el.tagName === 'base') return;
+    rewriteAttr(el, 'href');
   });
 
-  // Rewrite src attributes (scripts, images, iframes)
-  html = html.replace(/\s(src)=["']([^"']+)["']/gi, (match, attr, url) => {
-    return ` ${attr}="${rewriteUrl(url, baseUrl)}"`;
+  $('[src]').each((i, el) => {
+    rewriteAttr(el, 'src');
   });
 
-  // Rewrite srcset attributes
-  html = html.replace(/\ssrcset=["']([^"']+)["']/gi, (match, srcset) => {
-    const rewritten = srcset.replace(/(\S+)(\s+\S+)?/g, (part, url, descriptor) => {
-      return rewriteUrl(url, baseUrl) + (descriptor || '');
-    });
-    return ` srcset="${rewritten}"`;
+  $('[srcset]').each((i, el) => {
+    const current = $(el).attr('srcset');
+    if (!current) return;
+    $(el).attr('srcset', rewriteSrcset(current, pageBase));
   });
 
-  // Rewrite action attributes (forms)
-  html = html.replace(/\s(action)=["']([^"']+)["']/gi, (match, attr, url) => {
-    return ` ${attr}="${rewriteUrl(url, baseUrl)}"`;
+  $('[action]').each((i, el) => {
+    const action = $(el).attr('action') || '';
+    $(el).attr('action', rewriteActionUrl(action, pageBase));
   });
 
-  // Rewrite url() in inline styles
-  html = html.replace(/url\(["']?([^)"']+)["']?\)/gi, (match, url) => {
-    return `url("${rewriteUrl(url, baseUrl)}")`;
+  $('[formaction]').each((i, el) => {
+    const action = $(el).attr('formaction');
+    if (!action) return;
+    $(el).attr('formaction', rewriteActionUrl(action, pageBase));
   });
 
-  // Rewrite meta refresh
-  html = html.replace(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/gi, (tag) => {
-    return tag.replace(/url=([^"'\s;]+)/gi, (m, url) => {
-      return `url=${rewriteUrl(url, baseUrl)}`;
-    });
+  $('[poster]').each((i, el) => {
+    rewriteAttr(el, 'poster');
   });
 
-  // Rewrite window.location and fetch calls in inline scripts
-  html = html.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, code) => {
-    // Skip external scripts (they have src attr)
-    if (/src=/i.test(attrs)) return match;
-    code = code
-      .replace(/window\.location\.href\s*=\s*["']([^"']+)["']/g, (m, url) => {
-        return `window.location.href = "${rewriteUrl(url, baseUrl)}"`;
-      })
-      .replace(/window\.location\.replace\(["']([^"']+)["']\)/g, (m, url) => {
-        return `window.location.replace("${rewriteUrl(url, baseUrl)}")`;
-      });
-    return `<script${attrs}>${code}</script>`;
+  $('[data]').each((i, el) => {
+    rewriteAttr(el, 'data');
   });
 
-  return html;
+  $('[style]').each((i, el) => {
+    const style = $(el).attr('style');
+    if (style) {
+      $(el).attr('style', rewriteStyleUrls(style, pageBase));
+    }
+  });
+
+  $('style').each((i, el) => {
+    const style = $(el).html();
+    if (style) {
+      $(el).html(rewriteStyleUrls(style, pageBase));
+    }
+  });
+
+  $('meta[http-equiv]').each((i, el) => {
+    const content = $(el).attr('content');
+    if (content) {
+      $(el).attr('content', content.replace(/url=([^;]+)/gi, (m, url) => `url=${rewriteUrl(url, pageBase)}`));
+    }
+  });
+
+  const injectionScript = `<script>${getNavigationOverrideScript(pageBase)}</script>`;
+  if ($('head').length) {
+    $('head').prepend(injectionScript);
+  } else if ($('body').length) {
+    $('body').prepend(injectionScript);
+  } else {
+    $.root().prepend(injectionScript);
+  }
+
+  let output = $.html();
+  if (doctype && !output.toLowerCase().startsWith('<!doctype')) {
+    output = doctype + '\n' + output;
+  }
+  return output;
 }
 
 function rewriteCss(css, baseUrl) {
-  return css.replace(/url\(["']?([^)"']+)["']?\)/gi, (match, url) => {
+  return css.replace(/url\(["']?([^\)"']+)["']?\)/gi, (match, url) => {
     return `url("${rewriteUrl(url, baseUrl)}")`;
   });
 }
@@ -147,7 +334,8 @@ function rewriteCss(css, baseUrl) {
 // --- Overlay injected into every proxied HTML page ---
 function getOverlaySnippet(user) {
   const uptimeSeconds = Math.floor((Date.now() - SERVER_START) / 1000);
-  const barPct = Math.min(100, (user.dataUsed / MAX_DATA_MB) * 100).toFixed(1);
+  const dataLimit = user.dataLimit || MAX_DATA_MB;
+  const barPct = Math.min(100, (user.dataUsed / dataLimit) * 100).toFixed(1);
 
   return `
 <style>
@@ -238,7 +426,7 @@ function getOverlaySnippet(user) {
   <div class="epx-body">
     <div class="epx-row">
       <span>Data Usage</span>
-      <strong id="epx-data">${user.dataUsed.toFixed(2)} MB / ${MAX_DATA_MB} MB</strong>
+      <strong id="epx-data">${user.dataUsed.toFixed(2)} MB / ${dataLimit} MB</strong>
     </div>
     <div style="padding:0 0 12px;border-bottom:1px solid rgba(255,255,255,0.06)">
       <div id="epx-bar-bg"><div id="epx-bar-fill" style="width:${barPct}%"></div></div>
@@ -255,7 +443,6 @@ function getOverlaySnippet(user) {
 <script>
 (function() {
   const SERVER_URL = 'https://server.easyproxi.online';
-  const MAX_DATA_MB = ${MAX_DATA_MB};
   const UPTIME_OFFSET = ${uptimeSeconds};
   const PANEL_START = Date.now();
 
@@ -277,9 +464,9 @@ function getOverlaySnippet(user) {
       const dataEl = document.getElementById('epx-data');
       const reqEl = document.getElementById('epx-requests');
       const barEl = document.getElementById('epx-bar-fill');
-      if (dataEl) dataEl.textContent = data.dataUsed.toFixed(2) + ' MB / ' + MAX_DATA_MB + ' MB';
+      if (dataEl) dataEl.textContent = data.dataUsed.toFixed(2) + ' MB / ' + data.dataLimit + ' MB';
       if (reqEl) reqEl.textContent = data.requests;
-      if (barEl) barEl.style.width = Math.min(100, (data.dataUsed / MAX_DATA_MB) * 100).toFixed(1) + '%';
+      if (barEl) barEl.style.width = Math.min(100, (data.dataUsed / data.dataLimit) * 100).toFixed(1) + '%';
     } catch {}
   }
 
@@ -349,7 +536,7 @@ app.get('/api/me', (req, res) => {
   res.json({
     apiKey: user.apiKey,
     dataUsed: user.dataUsed,
-    dataLimit: MAX_DATA_MB,
+    dataLimit: user.dataLimit || MAX_DATA_MB,
     requests: user.requests,
     uptime: getServerUptime(),
     uptimeSeconds: Math.floor((Date.now() - SERVER_START) / 1000),
@@ -363,6 +550,7 @@ app.post('/api/reset', (req, res) => {
   const user = req.clientUser;
   user.dataUsed = 0;
   user.requests = 0;
+  saveUsersToFile();
   console.log(`[reset] ip=${req.clientIp}`);
   res.json({ success: true });
 });
@@ -373,6 +561,7 @@ app.post('/api/usage', (req, res) => {
   const { dataUsed, requests } = req.body;
   user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + (parseFloat(dataUsed) || 0));
   user.requests += parseInt(requests) || 0;
+  saveUsersToFile();
   res.json({ success: true, total: { dataUsed: user.dataUsed, requests: user.requests } });
 });
 
@@ -412,6 +601,7 @@ app.get('/api/proxy', async (req, res) => {
 
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
       user.requests += 1;
+      saveUsersToFile();
 
       console.log(`[proxy:html] ip=${req.clientIp} url=${url} size=${mb.toFixed(3)}MB total=${user.dataUsed.toFixed(2)}MB`);
 
@@ -426,6 +616,7 @@ app.get('/api/proxy', async (req, res) => {
       const mb = Buffer.byteLength(text, 'utf8') / (1024 * 1024);
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
       user.requests += 1;
+      saveUsersToFile();
 
       text = rewriteCss(text, url);
       res.status(response.status).send(text);
@@ -436,6 +627,7 @@ app.get('/api/proxy', async (req, res) => {
       const mb = Buffer.byteLength(text, 'utf8') / (1024 * 1024);
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
       user.requests += 1;
+      saveUsersToFile();
       res.status(response.status).send(text);
 
     } else {
@@ -443,6 +635,7 @@ app.get('/api/proxy', async (req, res) => {
       const buffer = await response.arrayBuffer();
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + buffer.byteLength / (1024 * 1024));
       user.requests += 1;
+      saveUsersToFile();
       res.status(response.status).send(Buffer.from(buffer));
     }
 
