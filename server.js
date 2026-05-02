@@ -1,89 +1,41 @@
 import express from 'express';
 import cors from 'cors';
 import { randomBytes } from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { load as cheerioLoad } from 'cheerio';
-import bcrypt from 'bcrypt';
-import session from 'express-session';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const MAX_DATA_MB = 100 * 1024; // 100 GB in megabytes
+const MAX_DATA_MB = 500;
 const SERVER_START = Date.now();
-const USERS_FILE = path.resolve('accounts.json');
 
 app.use(cors());
-app.use(session({
-  secret: 'easyproxi-secret-key-change-this-in-production',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: false } // set to true if using https
-}));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
-// --- User accounts store ---
-function loadUsersFromFile() {
-  try {
-    const raw = fs.readFileSync(USERS_FILE, 'utf-8');
-    const data = JSON.parse(raw);
-    return new Map(Object.entries(data));
-  } catch (err) {
-    if (err.code && err.code !== 'ENOENT') {
-      console.error('[accounts] failed to load accounts.json', err);
-    }
-    return new Map();
+// --- IP-based user store ---
+const users = new Map();
+
+function getClientIp(req) {
+  return (
+    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+function getOrCreateUser(ip) {
+  if (!users.has(ip)) {
+    const rand = () => randomBytes(3).toString('hex').toUpperCase();
+    users.set(ip, {
+      ip,
+      apiKey: `EPX-${rand()}-${rand()}-${rand()}`,
+      dataUsed: 0,
+      requests: 0,
+      createdAt: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+    });
   }
-}
-
-function saveUsersToFile() {
-  try {
-    const data = Object.fromEntries(users.entries());
-    fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[accounts] failed to save accounts.json', err);
-  }
-}
-
-function getUser(username) {
-  return users.get(username);
-}
-
-function createUser(username, password) {
-  const hash = bcrypt.hashSync(password, 10);
-  const user = {
-    username,
-    passwordHash: hash,
-    dataUsed: 0,
-    dataLimit: MAX_DATA_MB,
-    requests: 0,
-    createdAt: new Date().toISOString(),
-    lastSeen: new Date().toISOString()
-  };
-  users.set(username, user);
-  saveUsersToFile();
+  const user = users.get(ip);
+  user.lastSeen = new Date().toISOString();
   return user;
-}
-
-function authenticateUser(username, password) {
-  const user = users.get(username);
-  if (!user) return null;
-  if (bcrypt.compareSync(password, user.passwordHash)) {
-    user.lastSeen = new Date().toISOString();
-    saveUsersToFile();
-    return user;
-  }
-  return null;
-}
-
-const users = loadUsersFromFile();
-
-function requireAuth(req, res, next) {
-  if (!req.session.user) {
-    return res.redirect('/login');
-  }
-  next();
 }
 
 function getServerUptime() {
@@ -94,126 +46,15 @@ function getServerUptime() {
   return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
 }
 
-function escapeHtml(value) {
-  if (value == null) return '';
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function renderConsoleHtml(req) {
-  const dataLimit = MAX_DATA_MB;
-  const msg = req.query.msg ? `<p style="color: yellow;">${escapeHtml(req.query.msg)}</p>` : '';
-  const userRows = Array.from(users.values())
-    .map(user => `
-      <tr>
-        <td>${escapeHtml(user.username)}</td>
-        <td>${escapeHtml(user.dataUsed.toFixed ? user.dataUsed.toFixed(2) : user.dataUsed)}</td>
-        <td>${escapeHtml(user.dataLimit || dataLimit)}</td>
-        <td>${escapeHtml(user.requests)}</td>
-        <td>${escapeHtml(user.createdAt)}</td>
-        <td>${escapeHtml(user.lastSeen)}</td>
-      </tr>`)
-    .join('') || '<tr><td colspan="6">No users yet</td></tr>';
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EasyProxi Console</title>
-  <style>
-    body { margin: 0; padding: 0; background: #0b0f11; color: #c7f0a6; font-family: 'Ubuntu Mono', 'Fira Mono', 'Source Code Pro', monospace; }
-    .terminal { min-height: 100vh; padding: 24px; background: radial-gradient(circle at top, rgba(255,255,255,.05), transparent 25%), #0b0f11; }
-    .window { max-width: 1280px; margin: 0 auto; border-radius: 12px; overflow: hidden; box-shadow: 0 35px 120px rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.08); }
-    .window-header { display: flex; align-items: center; gap: 10px; padding: 12px 18px; background: linear-gradient(90deg, rgba(255,255,255,.06), rgba(255,255,255,.03)); }
-    .window-header .dot { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 1px rgba(0,0,0,.12); }
-    .window-header .dot:nth-child(2) { background: #ffbd2e; }
-    .window-header .dot:nth-child(3) { background: #28c840; }
-    .window-header .title { color: #d6e9b6; font-size: .95rem; letter-spacing: .04em; }
-    .panel { padding: 24px; background: #09100f; }
-    .section { margin-bottom: 24px; }
-    .section h1, .section h2 { margin: 0 0 12px 0; color: #c7f0a6; }
-    .section p { margin: 0 0 16px 0; color: #99c28f; }
-    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
-    .button { background: #15261c; border: 1px solid rgba(135, 211, 124, .12); color: #c7f0a6; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
-    .button:hover { background: #1f3c28; }
-    table { width: 100%; border-collapse: collapse; font-size: .95rem; }
-    th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(147, 197, 253, .08); }
-    th { color: #9ddc7c; font-weight: 700; }
-    tr:hover { background: rgba(157, 220, 124, .08); }
-    .small { font-size: 0.85rem; color: #8fae82; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
-    .stat { background: rgba(255,255,255,.03); border: 1px solid rgba(157,220,124,.12); border-radius: 12px; padding: 16px; }
-    .stat strong { display: block; margin-bottom: 8px; color: #9ddc7c; }
-    .stat div { color: #e4f7c3; font-size: 1.4rem; margin-top: 4px; }
-  </style>
-</head>
-<body>
-  <div class="terminal">
-    <div class="window">
-      <div class="window-header">
-        <span class="dot"></span>
-        <span class="dot"></span>
-        <span class="dot"></span>
-        <span class="title">root@easyproxi:~ /console</span>
-      </div>
-      <div class="panel">
-        <div class="section">
-          <h1>EasyProxi Console</h1>
-          <p class="small">Linux-style monitoring view for proxy users and limits.</p>
-          <p>Logged in as: ${escapeHtml(req.session.user)}</p>
-          ${msg}
-          <div class="toolbar">
-            <button class="button" onclick="location.reload()">refresh</button>
-            <form method="POST" action="/logout" style="display:inline;"><button type="submit" class="button">logout</button></form>
-          </div>
-        </div>
-        <div class="stats">
-          <div class="stat"><strong>total users</strong><div>${users.size}</div></div>
-          <div class="stat"><strong>default data limit</strong><div>${dataLimit} MB</div></div>
-        </div>
-      </div>
-    </div>
-
-  <div class="card">
-    <h2>Stored Users</h2>
-    <div style="overflow-x:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Username</th>
-            <th>Used MB</th>
-            <th>Limit MB</th>
-            <th>Requests</th>
-            <th>Created</th>
-            <th>Last Seen</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${userRows}
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>Command Line</h2>
-    <form method="POST" action="/console">
-      <input type="text" name="command" placeholder="Enter command..." style="background: #15261c; border: 1px solid rgba(135, 211, 124, .12); color: #c7f0a6; border-radius: 8px; padding: 10px; width: 100%; font-family: inherit;">
-      <button type="submit" class="button">Execute</button>
-    </form>
-    <p class="small">Commands: list, add &lt;username&gt; &lt;password&gt; &lt;limit&gt;, set &lt;username&gt; limit &lt;limit&gt;, delete &lt;username&gt;, reset &lt;username&gt;</p>
-  </div>
-</body>
-</html>`;
-}
+app.use((req, res, next) => {
+  req.clientIp = getClientIp(req);
+  req.clientUser = getOrCreateUser(req.clientIp);
+  next();
+});
 
 // --- URL rewriting ---
-const PROXY_PATH = '/api/proxy?url=';
+// Rewrites all URLs in HTML/CSS so they route through the proxy
+const PROXY_BASE = 'https://server.easyproxi.online/api/proxy?url=';
 
 function resolveUrl(base, relative) {
   try {
@@ -223,234 +64,82 @@ function resolveUrl(base, relative) {
   }
 }
 
-function isSkipUrl(url) {
-  if (!url) return true;
-  const trimmed = url.trim();
-  return (
-    trimmed.startsWith('data:') ||
-    trimmed.startsWith('blob:') ||
-    trimmed.startsWith('javascript:') ||
-    trimmed.startsWith('#') ||
-    trimmed.startsWith('mailto:') ||
-    trimmed.startsWith('tel:')
-  );
-}
-
-function isAlreadyProxied(resolved) {
-  return resolved.includes(PROXY_PATH);
-}
-
 function rewriteUrl(url, baseUrl) {
   if (!url) return url;
-  if (isSkipUrl(url)) return url;
+  url = url.trim();
+  if (
+    url.startsWith('data:') ||
+    url.startsWith('blob:') ||
+    url.startsWith('javascript:') ||
+    url.startsWith('#') ||
+    url.startsWith('mailto:') ||
+    url.startsWith('tel:')
+  ) return url;
+
   const resolved = resolveUrl(baseUrl, url);
   if (!resolved) return url;
-  if (isAlreadyProxied(resolved)) return url;
-  return PROXY_PATH + encodeURIComponent(resolved);
-}
 
-function rewriteActionUrl(url, baseUrl) {
-  const resolved = resolveUrl(baseUrl, url || '') || baseUrl;
-  if (!resolved) return url || baseUrl;
-  if (isAlreadyProxied(resolved)) return url || baseUrl;
-  return PROXY_PATH + encodeURIComponent(resolved);
-}
+  // Don't re-proxy already proxied URLs
+  if (resolved.startsWith('https://server.easyproxi.online')) return url;
 
-function rewriteSrcset(srcset, baseUrl) {
-  return srcset.replace(/(\S+)(\s+\S+)?/g, (part, url, descriptor) => {
-    return rewriteUrl(url, baseUrl) + (descriptor || '');
-  });
-}
-
-function rewriteStyleUrls(css, baseUrl) {
-  return css.replace(/url\(["']?([^\)"']+)["']?\)/gi, (match, url) => {
-    return `url("${rewriteUrl(url, baseUrl)}")`;
-  });
-}
-
-function getNavigationOverrideScript(pageUrl) {
-  return `(function() {
-  const proxyPrefix = '${PROXY_PATH}';
-  const originalPageUrl = ${JSON.stringify(pageUrl)};
-
-  function isProxyTarget(url) {
-    try {
-      const resolved = new URL(url, originalPageUrl).href;
-      return resolved.includes(proxyPrefix) || resolved.startsWith(window.location.origin + proxyPrefix);
-    } catch {
-      return false;
-    }
-  }
-
-  function resolveTargetUrl(url) {
-    try {
-      return new URL(url, originalPageUrl).href;
-    } catch {
-      return url;
-    }
-  }
-
-  function proxyUrl(url) {
-    if (!url) return url;
-    const trimmed = String(url).trim();
-    if (trimmed.startsWith('data:') || trimmed.startsWith('blob:') || trimmed.startsWith('javascript:') || trimmed.startsWith('mailto:') || trimmed.startsWith('tel:') || trimmed.startsWith('#')) {
-      return trimmed;
-    }
-    const resolved = resolveTargetUrl(trimmed);
-    if (isProxyTarget(resolved)) return resolved;
-    return proxyPrefix + encodeURIComponent(resolved);
-  }
-
-  const originalFetch = window.fetch.bind(window);
-  const originalOpen = window.open.bind(window);
-  const originalAssign = window.location.assign.bind(window.location);
-  const originalReplace = window.location.replace.bind(window.location);
-
-  window.fetch = function(resource, init) {
-    if (typeof resource === 'string') {
-      resource = proxyUrl(resource);
-    } else if (resource instanceof Request) {
-      resource = new Request(proxyUrl(resource.url), resource);
-    }
-    return originalFetch(resource, init);
-  };
-
-  window.open = function(url, target, features) {
-    return originalOpen(proxyUrl(url || originalPageUrl), target, features);
-  };
-
-  window.location.assign = function(url) {
-    return originalAssign(proxyUrl(url));
-  };
-
-  window.location.replace = function(url) {
-    return originalReplace(proxyUrl(url));
-  };
-
-  try {
-    Object.defineProperty(window, 'location', {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return location;
-      },
-      set(url) {
-        originalAssign(proxyUrl(url));
-      }
-    });
-    Object.defineProperty(document, 'location', {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return location;
-      },
-      set(url) {
-        originalAssign(proxyUrl(url));
-      }
-    });
-  } catch (e) {
-    // Some browsers do not allow redefining location
-  }
-
-  const xhrProto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
-  if (xhrProto) {
-    const originalXhrOpen = xhrProto.open;
-    xhrProto.open = function(method, url) {
-      const args = Array.prototype.slice.call(arguments);
-      args[1] = proxyUrl(args[1]);
-      return originalXhrOpen.apply(this, args);
-    };
-  }
-})();`;
+  return PROXY_BASE + encodeURIComponent(resolved);
 }
 
 function rewriteHtml(html, baseUrl) {
-  const doctypeMatch = html.match(/^\s*<!doctype[^>]*>/i);
-  const doctype = doctypeMatch ? doctypeMatch[0] : '';
-  const $ = cheerioLoad(html, { decodeEntities: false, lowerCaseAttributeNames: false });
-  const baseHref = $('base[href]').first().attr('href');
-  const pageBase = resolveUrl(baseUrl, baseHref || '') || baseUrl;
-
-  function rewriteAttr(el, attr, action = false) {
-    const current = $(el).attr(attr);
-    if (!current) return;
-    const rewritten = action ? rewriteActionUrl(current, pageBase) : rewriteUrl(current, pageBase);
-    if (rewritten) $(el).attr(attr, rewritten);
-  }
-
-  $('[href]').each((i, el) => {
-    if (el.tagName === 'base') return;
-    rewriteAttr(el, 'href');
+  // Rewrite href attributes (links, stylesheets)
+  html = html.replace(/\s(href)=["']([^"']+)["']/gi, (match, attr, url) => {
+    return ` ${attr}="${rewriteUrl(url, baseUrl)}"`;
   });
 
-  $('[src]').each((i, el) => {
-    rewriteAttr(el, 'src');
+  // Rewrite src attributes (scripts, images, iframes)
+  html = html.replace(/\s(src)=["']([^"']+)["']/gi, (match, attr, url) => {
+    return ` ${attr}="${rewriteUrl(url, baseUrl)}"`;
   });
 
-  $('[srcset]').each((i, el) => {
-    const current = $(el).attr('srcset');
-    if (!current) return;
-    $(el).attr('srcset', rewriteSrcset(current, pageBase));
+  // Rewrite srcset attributes
+  html = html.replace(/\ssrcset=["']([^"']+)["']/gi, (match, srcset) => {
+    const rewritten = srcset.replace(/(\S+)(\s+\S+)?/g, (part, url, descriptor) => {
+      return rewriteUrl(url, baseUrl) + (descriptor || '');
+    });
+    return ` srcset="${rewritten}"`;
   });
 
-  $('[action]').each((i, el) => {
-    const action = $(el).attr('action') || '';
-    $(el).attr('action', rewriteActionUrl(action, pageBase));
+  // Rewrite action attributes (forms)
+  html = html.replace(/\s(action)=["']([^"']+)["']/gi, (match, attr, url) => {
+    return ` ${attr}="${rewriteUrl(url, baseUrl)}"`;
   });
 
-  $('[formaction]').each((i, el) => {
-    const action = $(el).attr('formaction');
-    if (!action) return;
-    $(el).attr('formaction', rewriteActionUrl(action, pageBase));
+  // Rewrite url() in inline styles
+  html = html.replace(/url\(["']?([^)"']+)["']?\)/gi, (match, url) => {
+    return `url("${rewriteUrl(url, baseUrl)}")`;
   });
 
-  $('[poster]').each((i, el) => {
-    rewriteAttr(el, 'poster');
+  // Rewrite meta refresh
+  html = html.replace(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/gi, (tag) => {
+    return tag.replace(/url=([^"'\s;]+)/gi, (m, url) => {
+      return `url=${rewriteUrl(url, baseUrl)}`;
+    });
   });
 
-  $('[data]').each((i, el) => {
-    rewriteAttr(el, 'data');
+  // Rewrite window.location and fetch calls in inline scripts
+  html = html.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, code) => {
+    // Skip external scripts (they have src attr)
+    if (/src=/i.test(attrs)) return match;
+    code = code
+      .replace(/window\.location\.href\s*=\s*["']([^"']+)["']/g, (m, url) => {
+        return `window.location.href = "${rewriteUrl(url, baseUrl)}"`;
+      })
+      .replace(/window\.location\.replace\(["']([^"']+)["']\)/g, (m, url) => {
+        return `window.location.replace("${rewriteUrl(url, baseUrl)}")`;
+      });
+    return `<script${attrs}>${code}</script>`;
   });
 
-  $('[style]').each((i, el) => {
-    const style = $(el).attr('style');
-    if (style) {
-      $(el).attr('style', rewriteStyleUrls(style, pageBase));
-    }
-  });
-
-  $('style').each((i, el) => {
-    const style = $(el).html();
-    if (style) {
-      $(el).html(rewriteStyleUrls(style, pageBase));
-    }
-  });
-
-  $('meta[http-equiv]').each((i, el) => {
-    const content = $(el).attr('content');
-    if (content) {
-      $(el).attr('content', content.replace(/url=([^;]+)/gi, (m, url) => `url=${rewriteUrl(url, pageBase)}`));
-    }
-  });
-
-  const injectionScript = `<script>${getNavigationOverrideScript(pageBase)}</script>`;
-  if ($('head').length) {
-    $('head').prepend(injectionScript);
-  } else if ($('body').length) {
-    $('body').prepend(injectionScript);
-  } else {
-    $.root().prepend(injectionScript);
-  }
-
-  let output = $.html();
-  if (doctype && !output.toLowerCase().startsWith('<!doctype')) {
-    output = doctype + '\n' + output;
-  }
-  return output;
+  return html;
 }
 
 function rewriteCss(css, baseUrl) {
-  return css.replace(/url\(["']?([^\)"']+)["']?\)/gi, (match, url) => {
+  return css.replace(/url\(["']?([^)"']+)["']?\)/gi, (match, url) => {
     return `url("${rewriteUrl(url, baseUrl)}")`;
   });
 }
@@ -458,8 +147,7 @@ function rewriteCss(css, baseUrl) {
 // --- Overlay injected into every proxied HTML page ---
 function getOverlaySnippet(user) {
   const uptimeSeconds = Math.floor((Date.now() - SERVER_START) / 1000);
-  const dataLimit = user.dataLimit || MAX_DATA_MB;
-  const barPct = Math.min(100, (user.dataUsed / dataLimit) * 100).toFixed(1);
+  const barPct = Math.min(100, (user.dataUsed / MAX_DATA_MB) * 100).toFixed(1);
 
   return `
 <style>
@@ -550,7 +238,7 @@ function getOverlaySnippet(user) {
   <div class="epx-body">
     <div class="epx-row">
       <span>Data Usage</span>
-      <strong id="epx-data">${user.dataUsed.toFixed(2)} MB / ${dataLimit} MB</strong>
+      <strong id="epx-data">${user.dataUsed.toFixed(2)} MB / ${MAX_DATA_MB} MB</strong>
     </div>
     <div style="padding:0 0 12px;border-bottom:1px solid rgba(255,255,255,0.06)">
       <div id="epx-bar-bg"><div id="epx-bar-fill" style="width:${barPct}%"></div></div>
@@ -567,6 +255,7 @@ function getOverlaySnippet(user) {
 <script>
 (function() {
   const SERVER_URL = 'https://server.easyproxi.online';
+  const MAX_DATA_MB = ${MAX_DATA_MB};
   const UPTIME_OFFSET = ${uptimeSeconds};
   const PANEL_START = Date.now();
 
@@ -588,9 +277,9 @@ function getOverlaySnippet(user) {
       const dataEl = document.getElementById('epx-data');
       const reqEl = document.getElementById('epx-requests');
       const barEl = document.getElementById('epx-bar-fill');
-      if (dataEl) dataEl.textContent = data.dataUsed.toFixed(2) + ' MB / ' + data.dataLimit + ' MB';
+      if (dataEl) dataEl.textContent = data.dataUsed.toFixed(2) + ' MB / ' + MAX_DATA_MB + ' MB';
       if (reqEl) reqEl.textContent = data.requests;
-      if (barEl) barEl.style.width = Math.min(100, (data.dataUsed / data.dataLimit) * 100).toFixed(1) + '%';
+      if (barEl) barEl.style.width = Math.min(100, (data.dataUsed / MAX_DATA_MB) * 100).toFixed(1) + '%';
     } catch {}
   }
 
@@ -655,12 +344,12 @@ app.get('/api/status', (req, res) => {
 });
 
 // --- GET /api/me ---
-app.get('/api/me', requireAuth, (req, res) => {
-  const user = getUser(req.session.user);
+app.get('/api/me', (req, res) => {
+  const user = req.clientUser;
   res.json({
-    username: user.username,
+    apiKey: user.apiKey,
     dataUsed: user.dataUsed,
-    dataLimit: user.dataLimit || MAX_DATA_MB,
+    dataLimit: MAX_DATA_MB,
     requests: user.requests,
     uptime: getServerUptime(),
     uptimeSeconds: Math.floor((Date.now() - SERVER_START) / 1000),
@@ -670,46 +359,29 @@ app.get('/api/me', requireAuth, (req, res) => {
 });
 
 // --- POST /api/reset ---
-app.post('/api/reset', requireAuth, (req, res) => {
-  const user = getUser(req.session.user);
+app.post('/api/reset', (req, res) => {
+  const user = req.clientUser;
   user.dataUsed = 0;
   user.requests = 0;
-  saveUsersToFile();
-  console.log(`[reset] user=${req.session.user}`);
+  console.log(`[reset] ip=${req.clientIp}`);
   res.json({ success: true });
 });
 
 // --- POST /api/usage (legacy) ---
-app.post('/api/usage', requireAuth, (req, res) => {
-  const user = getUser(req.session.user);
+app.post('/api/usage', (req, res) => {
+  const user = req.clientUser;
   const { dataUsed, requests } = req.body;
   user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + (parseFloat(dataUsed) || 0));
   user.requests += parseInt(requests) || 0;
-  saveUsersToFile();
   res.json({ success: true, total: { dataUsed: user.dataUsed, requests: user.requests } });
 });
 
 // --- GET /api/proxy?url=... ---
-app.get('/api/proxy', requireAuth, async (req, res) => {
+app.get('/api/proxy', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Missing URL');
 
-  const user = getUser(req.session.user);
-  const limit = user.dataLimit || MAX_DATA_MB;
-  if (user.dataUsed >= limit) {
-    return res.status(429).send(`
-      <!doctype html>
-      <html>
-      <head><title>Data Limit Exceeded</title></head>
-      <body>
-        <h1>Data Limit Exceeded</h1>
-        <p>You have used ${user.dataUsed.toFixed(2)} MB out of ${limit} MB.</p>
-        <p>Please reset your usage or contact admin.</p>
-        <a href="/console">Go to Console</a>
-      </body>
-      </html>
-    `);
-  }
+  const user = req.clientUser;
 
   try {
     const response = await fetch(url, {
@@ -740,7 +412,6 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
 
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
       user.requests += 1;
-      saveUsersToFile();
 
       console.log(`[proxy:html] ip=${req.clientIp} url=${url} size=${mb.toFixed(3)}MB total=${user.dataUsed.toFixed(2)}MB`);
 
@@ -755,7 +426,6 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
       const mb = Buffer.byteLength(text, 'utf8') / (1024 * 1024);
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
       user.requests += 1;
-      saveUsersToFile();
 
       text = rewriteCss(text, url);
       res.status(response.status).send(text);
@@ -766,7 +436,6 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
       const mb = Buffer.byteLength(text, 'utf8') / (1024 * 1024);
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
       user.requests += 1;
-      saveUsersToFile();
       res.status(response.status).send(text);
 
     } else {
@@ -774,140 +443,12 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
       const buffer = await response.arrayBuffer();
       user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + buffer.byteLength / (1024 * 1024));
       user.requests += 1;
-      saveUsersToFile();
       res.status(response.status).send(Buffer.from(buffer));
     }
 
   } catch (err) {
     console.error(`[proxy:error] url=${url} err=${err.message}`);
     res.status(500).send('Proxy error: ' + err.message);
-  }
-});
-
-// --- Console HTML ---
-app.get('/console', requireAuth, (req, res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(renderConsoleHtml(req));
-});
-
-app.post('/console', requireAuth, (req, res) => {
-  const cmd = req.body.command?.trim();
-  if (!cmd) return res.redirect('/console?msg=Empty command');
-  const parts = cmd.split(/\s+/);
-  const action = parts[0].toLowerCase();
-  let msg = '';
-  try {
-    if (action === 'list') {
-      msg = 'Users listed above';
-    } else if (action === 'add' && parts.length >= 4) {
-      const username = parts[1];
-      const password = parts[2];
-      const limit = parseInt(parts[3]);
-      if (!username || !password || isNaN(limit)) throw new Error('Invalid username, password or limit');
-      if (users.has(username)) throw new Error('User already exists');
-      const user = createUser(username, password);
-      user.dataLimit = limit;
-      saveUsersToFile();
-      msg = `User ${username} added with limit ${limit} MB`;
-    } else if (action === 'set' && parts[1] && parts[2] === 'limit' && parts.length >= 4) {
-      const username = parts[1];
-      const limit = parseInt(parts[3]);
-      const user = users.get(username);
-      if (!user) throw new Error('User not found');
-      user.dataLimit = limit;
-      saveUsersToFile();
-      msg = `Limit for ${username} set to ${limit} MB`;
-    } else if (action === 'delete' && parts.length >= 2) {
-      const username = parts[1];
-      if (users.delete(username)) {
-        saveUsersToFile();
-        msg = `User ${username} deleted`;
-      } else {
-        msg = `User ${username} not found`;
-      }
-    } else if (action === 'reset' && parts.length >= 2) {
-      const username = parts[1];
-      const user = users.get(username);
-      if (!user) throw new Error('User not found');
-      user.dataUsed = 0;
-      saveUsersToFile();
-      msg = `Data usage for ${username} reset to 0`;
-    } else {
-      throw new Error('Unknown command. Use: list, add <username> <limit>, set <username> limit <limit>, delete <username>, reset <username>');
-    }
-  } catch (e) {
-    msg = 'Error: ' + e.message;
-  }
-  res.redirect('/console?msg=' + encodeURIComponent(msg));
-});
-
-// --- Auth routes ---
-app.get('/register', (req, res) => {
-  if (req.session.user) return res.redirect('/console');
-  res.send(`
-    <!doctype html>
-    <html>
-    <head><title>Register</title></head>
-    <body>
-      <h1>Register</h1>
-      <form method="POST" action="/register">
-        <input name="username" placeholder="Username" required><br>
-        <input name="password" type="password" placeholder="Password" required><br>
-        <button type="submit">Register</button>
-      </form>
-      <a href="/login">Login</a>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/register', (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.send('Missing fields');
-  if (users.has(username)) return res.send('User exists');
-  createUser(username, password);
-  req.session.user = username;
-  res.redirect('/console');
-});
-
-app.get('/login', (req, res) => {
-  if (req.session.user) return res.redirect('/console');
-  res.send(`
-    <!doctype html>
-    <html>
-    <head><title>Login</title></head>
-    <body>
-      <h1>Login</h1>
-      <form method="POST" action="/login">
-        <input name="username" placeholder="Username" required><br>
-        <input name="password" type="password" placeholder="Password" required><br>
-        <button type="submit">Login</button>
-      </form>
-      <a href="/register">Register</a>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = authenticateUser(username, password);
-  if (!user) return res.send('Invalid credentials');
-  req.session.user = username;
-  res.redirect('/console');
-});
-
-app.post('/logout', (req, res) => {
-  req.session.destroy();
-  res.redirect('/login');
-});
-
-// --- Root redirect ---
-app.get('/', (req, res) => {
-  if (req.session.user) {
-    res.redirect('/console');
-  } else {
-    res.redirect('/login');
   }
 });
 
