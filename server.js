@@ -82,6 +82,113 @@ function getServerUptime() {
   return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
 }
 
+function escapeHtml(value) {
+  if (value == null) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderConsoleHtml() {
+  const dataLimit = MAX_DATA_MB;
+  const userRows = Array.from(users.values())
+    .map(user => `
+      <tr>
+        <td>${escapeHtml(user.ip)}</td>
+        <td>${escapeHtml(user.apiKey)}</td>
+        <td>${escapeHtml(user.dataUsed.toFixed ? user.dataUsed.toFixed(2) : user.dataUsed)}</td>
+        <td>${escapeHtml(user.dataLimit || dataLimit)}</td>
+        <td>${escapeHtml(user.requests)}</td>
+        <td>${escapeHtml(user.createdAt)}</td>
+        <td>${escapeHtml(user.lastSeen)}</td>
+      </tr>`)
+    .join('') || '<tr><td colspan="7">No users yet</td></tr>';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EasyProxi Console</title>
+  <style>
+    body { margin: 0; padding: 0; background: #0b0f11; color: #c7f0a6; font-family: 'Ubuntu Mono', 'Fira Mono', 'Source Code Pro', monospace; }
+    .terminal { min-height: 100vh; padding: 24px; background: radial-gradient(circle at top, rgba(255,255,255,.05), transparent 25%), #0b0f11; }
+    .window { max-width: 1280px; margin: 0 auto; border-radius: 12px; overflow: hidden; box-shadow: 0 35px 120px rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.08); }
+    .window-header { display: flex; align-items: center; gap: 10px; padding: 12px 18px; background: linear-gradient(90deg, rgba(255,255,255,.06), rgba(255,255,255,.03)); }
+    .window-header .dot { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 1px rgba(0,0,0,.12); }
+    .window-header .dot:nth-child(2) { background: #ffbd2e; }
+    .window-header .dot:nth-child(3) { background: #28c840; }
+    .window-header .title { color: #d6e9b6; font-size: .95rem; letter-spacing: .04em; }
+    .panel { padding: 24px; background: #09100f; }
+    .section { margin-bottom: 24px; }
+    .section h1, .section h2 { margin: 0 0 12px 0; color: #c7f0a6; }
+    .section p { margin: 0 0 16px 0; color: #99c28f; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
+    .button { background: #15261c; border: 1px solid rgba(135, 211, 124, .12); color: #c7f0a6; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
+    .button:hover { background: #1f3c28; }
+    table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+    th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid rgba(147, 197, 253, .08); }
+    th { color: #9ddc7c; font-weight: 700; }
+    tr:hover { background: rgba(157, 220, 124, .08); }
+    .small { font-size: 0.85rem; color: #8fae82; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+    .stat { background: rgba(255,255,255,.03); border: 1px solid rgba(157,220,124,.12); border-radius: 12px; padding: 16px; }
+    .stat strong { display: block; margin-bottom: 8px; color: #9ddc7c; }
+    .stat div { color: #e4f7c3; font-size: 1.4rem; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <div class="terminal">
+    <div class="window">
+      <div class="window-header">
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="dot"></span>
+        <span class="title">root@easyproxi:~ /console</span>
+      </div>
+      <div class="panel">
+        <div class="section">
+          <h1>EasyProxi Console</h1>
+          <p class="small">Linux-style monitoring view for proxy users and limits.</p>
+          <div class="toolbar">
+            <button class="button" onclick="location.reload()">refresh</button>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat"><strong>total users</strong><div>${users.size}</div></div>
+          <div class="stat"><strong>default data limit</strong><div>${dataLimit} MB</div></div>
+        </div>
+      </div>
+    </div>
+
+  <div class="card">
+    <h2>Stored Users</h2>
+    <div style="overflow-x:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>IP</th>
+            <th>API Key</th>
+            <th>Used MB</th>
+            <th>Limit MB</th>
+            <th>Requests</th>
+            <th>Created</th>
+            <th>Last Seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${userRows}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 app.use((req, res, next) => {
   req.clientIp = getClientIp(req);
   req.clientUser = getOrCreateUser(req.clientIp);
@@ -643,6 +750,12 @@ app.get('/api/proxy', async (req, res) => {
     console.error(`[proxy:error] url=${url} err=${err.message}`);
     res.status(500).send('Proxy error: ' + err.message);
   }
+});
+
+// --- Console HTML ---
+app.get('/console', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(renderConsoleHtml());
 });
 
 // --- Root ---
