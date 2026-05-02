@@ -92,8 +92,9 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-function renderConsoleHtml() {
+function renderConsoleHtml(req) {
   const dataLimit = MAX_DATA_MB;
+  const msg = req.query.msg ? `<p style="color: yellow;">${escapeHtml(req.query.msg)}</p>` : '';
   const userRows = Array.from(users.values())
     .map(user => `
       <tr>
@@ -153,6 +154,7 @@ function renderConsoleHtml() {
         <div class="section">
           <h1>EasyProxi Console</h1>
           <p class="small">Linux-style monitoring view for proxy users and limits.</p>
+          ${msg}
           <div class="toolbar">
             <button class="button" onclick="location.reload()">refresh</button>
           </div>
@@ -185,8 +187,21 @@ function renderConsoleHtml() {
       </table>
     </div>
   </div>
+
+  <div class="section">
+    <h2>Command Line</h2>
+    <form method="POST" action="/console">
+      <input type="text" name="command" placeholder="Enter command..." style="background: #15261c; border: 1px solid rgba(135, 211, 124, .12); color: #c7f0a6; border-radius: 8px; padding: 10px; width: 100%; font-family: inherit;">
+      <button type="submit" class="button">Execute</button>
+    </form>
+    <p class="small">Commands: list, add &lt;ip&gt; &lt;limit&gt;, set &lt;ip&gt; limit &lt;limit&gt;, delete &lt;ip&gt;, reset &lt;ip&gt;</p>
+  </div>
 </body>
 </html>`;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
 app.use((req, res, next) => {
@@ -755,7 +770,56 @@ app.get('/api/proxy', async (req, res) => {
 // --- Console HTML ---
 app.get('/console', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(renderConsoleHtml());
+  res.send(renderConsoleHtml(req));
+});
+
+app.post('/console', (req, res) => {
+  const cmd = req.body.command?.trim();
+  if (!cmd) return res.redirect('/console?msg=Empty command');
+  const parts = cmd.split(/\s+/);
+  const action = parts[0].toLowerCase();
+  let msg = '';
+  try {
+    if (action === 'list') {
+      msg = 'Users listed above';
+    } else if (action === 'add' && parts.length >= 3) {
+      const ip = parts[1];
+      const limit = parseInt(parts[2]);
+      if (!ip || isNaN(limit)) throw new Error('Invalid IP or limit');
+      const user = getOrCreateUser(ip);
+      user.dataLimit = limit;
+      saveUsersToFile();
+      msg = `User ${ip} added/updated with limit ${limit} MB`;
+    } else if (action === 'set' && parts[1] && parts[2] === 'limit' && parts.length >= 4) {
+      const ip = parts[1];
+      const limit = parseInt(parts[3]);
+      const user = users.get(ip);
+      if (!user) throw new Error('User not found');
+      user.dataLimit = limit;
+      saveUsersToFile();
+      msg = `Limit for ${ip} set to ${limit} MB`;
+    } else if (action === 'delete' && parts.length >= 2) {
+      const ip = parts[1];
+      if (users.delete(ip)) {
+        saveUsersToFile();
+        msg = `User ${ip} deleted`;
+      } else {
+        msg = `User ${ip} not found`;
+      }
+    } else if (action === 'reset' && parts.length >= 2) {
+      const ip = parts[1];
+      const user = users.get(ip);
+      if (!user) throw new Error('User not found');
+      user.dataUsed = 0;
+      saveUsersToFile();
+      msg = `Data usage for ${ip} reset to 0`;
+    } else {
+      throw new Error('Unknown command. Use: list, add <ip> <limit>, set <ip> limit <limit>, delete <ip>, reset <ip>');
+    }
+  } catch (e) {
+    msg = 'Error: ' + e.message;
+  }
+  res.redirect('/console?msg=' + encodeURIComponent(msg));
 });
 
 // --- Root ---
