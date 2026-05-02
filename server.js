@@ -4,39 +4,61 @@ import { randomBytes } from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const MAX_DATA_MB = 500;
+const SERVER_START = Date.now();
 
 app.use(cors());
 app.use(express.json());
 
-// --- In-memory store ---
-const apiKeys = new Map();
-const usageStore = new Map();
+// --- IP-based user store (in-memory) ---
+// Structure: { [ip]: { apiKey, dataUsed, requests, createdAt, lastSeen } }
+const users = new Map();
 
-function getOrCreateUser(apiKey) {
-  if (!apiKeys.has(apiKey)) {
-    apiKeys.set(apiKey, {
-      id: `user-${randomBytes(4).toString('hex')}`,
-      username: 'easyproxi-user',
-      email: 'user@easyproxi.local',
-      plan: 'free',
-      dataLimit: 500,
+function getClientIp(req) {
+  return (
+    req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+function getOrCreateUser(ip) {
+  if (!users.has(ip)) {
+    const rand = () => randomBytes(3).toString('hex').toUpperCase();
+    users.set(ip, {
+      ip,
+      apiKey: `EPX-${rand()}-${rand()}-${rand()}`,
+      dataUsed: 0,
+      requests: 0,
       createdAt: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
     });
-    usageStore.set(apiKey, { dataUsed: 0, requests: 0 });
   }
-  return apiKeys.get(apiKey);
+  const user = users.get(ip);
+  user.lastSeen = new Date().toISOString();
+  return user;
 }
 
-function requireApiKey(req, res, next) {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey) return res.status(401).json({ error: 'API key required' });
-  req.apiKey = apiKey;
-  req.user = getOrCreateUser(apiKey);
+function getServerUptime() {
+  const elapsed = Date.now() - SERVER_START;
+  const h = Math.floor(elapsed / 3600000);
+  const m = Math.floor((elapsed % 3600000) / 60000);
+  const s = Math.floor((elapsed % 60000) / 1000);
+  return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+}
+
+// --- Attach user to every request ---
+app.use((req, res, next) => {
+  req.clientIp = getClientIp(req);
+  req.clientUser = getOrCreateUser(req.clientIp);
   next();
-}
+});
 
-// --- Overlay HTML/CSS/JS to inject into every proxied page ---
-function getOverlaySnippet() {
+// --- Overlay injected into every proxied HTML page ---
+function getOverlaySnippet(user) {
+  const uptimeSeconds = Math.floor((Date.now() - SERVER_START) / 1000);
+  const barPct = Math.min(100, (user.dataUsed / MAX_DATA_MB) * 100).toFixed(1);
+
   return `
 <style>
   #epx-overlay {
@@ -66,10 +88,7 @@ function getOverlaySnippet() {
     color: #d9f2ff !important;
     font-weight: 600 !important;
   }
-  #epx-overlay .epx-drag {
-    font-size: 0.85rem !important;
-    color: #94b5d5 !important;
-  }
+  #epx-overlay .epx-drag { font-size: 0.85rem !important; color: #94b5d5 !important; }
   #epx-overlay .epx-body { padding: 20px !important; }
   #epx-overlay .epx-row {
     display: flex !important;
@@ -102,6 +121,20 @@ function getOverlaySnippet() {
     padding: 0 0 0 10px !important;
     line-height: 1 !important;
   }
+  #epx-bar-bg {
+    width: 100% !important;
+    height: 6px !important;
+    background: rgba(255,255,255,0.08) !important;
+    border-radius: 99px !important;
+    margin-top: 6px !important;
+    overflow: hidden !important;
+  }
+  #epx-bar-fill {
+    height: 100% !important;
+    border-radius: 99px !important;
+    background: linear-gradient(90deg, #2dc4ff, #3c80ff) !important;
+    transition: width 0.4s ease !important;
+  }
 </style>
 
 <div id="epx-overlay">
@@ -113,10 +146,16 @@ function getOverlaySnippet() {
     </div>
   </div>
   <div class="epx-body">
-    <div class="epx-row"><span>Data Usage</span><strong id="epx-data">-- MB</strong></div>
-    <div class="epx-row"><span>Requests</span><strong id="epx-requests">--</strong></div>
-    <div class="epx-row"><span>Uptime</span><strong id="epx-uptime">00:00:00</strong></div>
-    <div class="epx-row"><span>API Key</span><strong id="epx-key" style="font-size:0.75rem">...</strong></div>
+    <div class="epx-row">
+      <span>Data Usage</span>
+      <strong id="epx-data">${user.dataUsed.toFixed(2)} MB / ${MAX_DATA_MB} MB</strong>
+    </div>
+    <div style="padding:0 0 12px;border-bottom:1px solid rgba(255,255,255,0.06)">
+      <div id="epx-bar-bg"><div id="epx-bar-fill" style="width:${barPct}%"></div></div>
+    </div>
+    <div class="epx-row"><span>Requests</span><strong id="epx-requests">${user.requests}</strong></div>
+    <div class="epx-row"><span>Server Uptime</span><strong id="epx-uptime">00:00:00</strong></div>
+    <div class="epx-row"><span>API Key</span><strong id="epx-key" style="font-size:0.75rem;word-break:break-all">${user.apiKey}</strong></div>
   </div>
   <div class="epx-footer">
     <button id="epx-reset">Reset Session</button>
@@ -125,45 +164,33 @@ function getOverlaySnippet() {
 
 <script>
 (function() {
-  const STORAGE_KEY = 'easyproxi-data';
-  const API_KEY_KEY = 'easyproxi-api-key';
-  const MAX_DATA_MB = 500;
   const SERVER_URL = 'https://server.easyproxi.online';
-  const UPTIME_START = Date.now();
-
-  function getOrCreateApiKey() {
-    let key = localStorage.getItem(API_KEY_KEY);
-    if (!key) {
-      const rand = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-      key = 'EPX-' + rand() + '-' + rand() + '-' + rand();
-      localStorage.setItem(API_KEY_KEY, key);
-    }
-    return key;
-  }
-
-  function loadStats() {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      return stored ? JSON.parse(stored) : { dataUsed: 0, requests: 0 };
-    } catch { return { dataUsed: 0, requests: 0 }; }
-  }
-
-  function updatePanel() {
-    const stats = loadStats();
-    const el = (id) => document.getElementById(id);
-    if (el('epx-data')) el('epx-data').textContent = stats.dataUsed.toFixed(2) + ' MB / ' + MAX_DATA_MB + ' MB';
-    if (el('epx-requests')) el('epx-requests').textContent = stats.requests;
-    if (el('epx-key')) el('epx-key').textContent = getOrCreateApiKey();
-  }
+  const MAX_DATA_MB = ${MAX_DATA_MB};
+  const UPTIME_OFFSET = ${uptimeSeconds};
+  const PANEL_START = Date.now();
 
   function updateUptime() {
     const el = document.getElementById('epx-uptime');
     if (!el) return;
-    const elapsed = Date.now() - UPTIME_START;
-    const h = Math.floor(elapsed / 3600000);
-    const m = Math.floor((elapsed % 3600000) / 60000);
-    const s = Math.floor((elapsed % 60000) / 1000);
+    const total = UPTIME_OFFSET + Math.floor((Date.now() - PANEL_START) / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
     el.textContent = [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
+  }
+
+  async function syncStats() {
+    try {
+      const res = await fetch(SERVER_URL + '/api/me');
+      if (!res.ok) return;
+      const data = await res.json();
+      const dataEl = document.getElementById('epx-data');
+      const reqEl = document.getElementById('epx-requests');
+      const barEl = document.getElementById('epx-bar-fill');
+      if (dataEl) dataEl.textContent = data.dataUsed.toFixed(2) + ' MB / ' + MAX_DATA_MB + ' MB';
+      if (reqEl) reqEl.textContent = data.requests;
+      if (barEl) barEl.style.width = Math.min(100, (data.dataUsed / MAX_DATA_MB) * 100).toFixed(1) + '%';
+    } catch {}
   }
 
   // Dragging
@@ -179,44 +206,37 @@ function getOverlaySnippet() {
     dragOffset.x = e.clientX - rect.left;
     dragOffset.y = e.clientY - rect.top;
   });
-
   panel.addEventListener('pointermove', function(e) {
     if (!isDragging) return;
-    const x = e.clientX - dragOffset.x;
-    const y = e.clientY - dragOffset.y;
-    panel.style.left = Math.max(12, Math.min(window.innerWidth - panel.offsetWidth - 12, x)) + 'px';
-    panel.style.top = Math.max(12, Math.min(window.innerHeight - panel.offsetHeight - 12, y)) + 'px';
+    panel.style.left = Math.max(12, Math.min(window.innerWidth - panel.offsetWidth - 12, e.clientX - dragOffset.x)) + 'px';
+    panel.style.top = Math.max(12, Math.min(window.innerHeight - panel.offsetHeight - 12, e.clientY - dragOffset.y)) + 'px';
     panel.style.right = 'auto';
   });
-
   panel.addEventListener('pointerup', function() { isDragging = false; });
   panel.addEventListener('pointercancel', function() { isDragging = false; });
 
-  // Close button
   document.getElementById('epx-close').addEventListener('click', function() {
     panel.style.display = 'none';
   });
 
-  // Reset button
-  document.getElementById('epx-reset').addEventListener('click', function() {
-    localStorage.removeItem(STORAGE_KEY);
-    localStorage.removeItem(API_KEY_KEY);
-    updatePanel();
+  document.getElementById('epx-reset').addEventListener('click', async function() {
+    try {
+      await fetch(SERVER_URL + '/api/reset', { method: 'POST' });
+      await syncStats();
+    } catch {}
   });
 
-  // Init
-  updatePanel();
   setInterval(updateUptime, 1000);
-  setInterval(updatePanel, 3000); // Sync stats every 3s in case main app updated them
+  setInterval(syncStats, 5000);
+  updateUptime();
+  syncStats();
 })();
 </script>
 `;
 }
 
-// --- Inject overlay into HTML responses ---
-function injectOverlay(html) {
-  const snippet = getOverlaySnippet();
-  // Try to inject before </body>, fallback to appending
+function injectOverlay(html, user) {
+  const snippet = getOverlaySnippet(user);
   if (html.includes('</body>')) {
     return html.replace('</body>', snippet + '</body>');
   }
@@ -227,34 +247,52 @@ function injectOverlay(html) {
 app.get('/api/status', (req, res) => {
   res.json({
     status: 'online',
-    uptime: Math.floor(process.uptime()),
+    uptime: getServerUptime(),
+    uptimeSeconds: Math.floor((Date.now() - SERVER_START) / 1000),
     timestamp: new Date().toISOString(),
+    totalUsers: users.size,
   });
 });
 
-// --- GET /api/user ---
-app.get('/api/user', requireApiKey, (req, res) => {
-  res.json(req.user);
+// --- GET /api/me — current user's full data by IP ---
+app.get('/api/me', (req, res) => {
+  const user = req.clientUser;
+  res.json({
+    apiKey: user.apiKey,
+    dataUsed: user.dataUsed,
+    dataLimit: MAX_DATA_MB,
+    requests: user.requests,
+    uptime: getServerUptime(),
+    uptimeSeconds: Math.floor((Date.now() - SERVER_START) / 1000),
+    createdAt: user.createdAt,
+    lastSeen: user.lastSeen,
+  });
 });
 
-// --- POST /api/usage ---
-app.post('/api/usage', requireApiKey, (req, res) => {
+// --- POST /api/reset — reset current user's stats ---
+app.post('/api/reset', (req, res) => {
+  const user = req.clientUser;
+  user.dataUsed = 0;
+  user.requests = 0;
+  console.log(`[reset] ip=${req.clientIp}`);
+  res.json({ success: true });
+});
+
+// --- POST /api/usage (legacy support) ---
+app.post('/api/usage', (req, res) => {
+  const user = req.clientUser;
   const { dataUsed, requests } = req.body;
-  const current = usageStore.get(req.apiKey) || { dataUsed: 0, requests: 0 };
-
-  usageStore.set(req.apiKey, {
-    dataUsed: (current.dataUsed || 0) + (parseFloat(dataUsed) || 0),
-    requests: (current.requests || 0) + (parseInt(requests) || 0),
-  });
-
-  console.log(`[usage] key=${req.apiKey} dataUsed=${dataUsed}MB requests=${requests}`);
-  res.json({ success: true, message: 'Usage tracked', total: usageStore.get(req.apiKey) });
+  user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + (parseFloat(dataUsed) || 0));
+  user.requests += parseInt(requests) || 0;
+  res.json({ success: true, total: { dataUsed: user.dataUsed, requests: user.requests } });
 });
 
 // --- GET /api/proxy?url=... ---
 app.get('/api/proxy', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('Missing URL');
+
+  const user = req.clientUser;
 
   try {
     const response = await fetch(url, {
@@ -270,16 +308,23 @@ app.get('/api/proxy', async (req, res) => {
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Access-Control-Allow-Origin', '*');
-    // Remove headers that would block injection or cause issues
     res.removeHeader('Content-Security-Policy');
     res.removeHeader('X-Frame-Options');
 
     if (isHtml) {
       const text = await response.text();
-      const injected = injectOverlay(text);
-      res.status(response.status).send(injected);
+      const mb = Buffer.byteLength(text, 'utf8') / (1024 * 1024);
+
+      user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + mb);
+      user.requests += 1;
+
+      console.log(`[proxy] ip=${req.clientIp} url=${url} size=${mb.toFixed(3)}MB total=${user.dataUsed.toFixed(2)}MB`);
+
+      res.status(response.status).send(injectOverlay(text, user));
     } else {
       const buffer = await response.arrayBuffer();
+      user.dataUsed = Math.min(MAX_DATA_MB, user.dataUsed + buffer.byteLength / (1024 * 1024));
+      user.requests += 1;
       res.status(response.status).send(Buffer.from(buffer));
     }
   } catch (err) {
@@ -289,7 +334,7 @@ app.get('/api/proxy', async (req, res) => {
 
 // --- Root ---
 app.get('/', (req, res) => {
-  res.json({ name: 'EasyProxi Server', version: '1.0.0', status: 'online' });
+  res.json({ name: 'EasyProxi Server', version: '2.0.0', status: 'online' });
 });
 
 app.listen(PORT, () => {
