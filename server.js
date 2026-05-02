@@ -695,6 +695,21 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
   if (!url) return res.status(400).send('Missing URL');
 
   const user = getUser(req.session.user);
+  const limit = user.dataLimit || MAX_DATA_MB;
+  if (user.dataUsed >= limit) {
+    return res.status(429).send(`
+      <!doctype html>
+      <html>
+      <head><title>Data Limit Exceeded</title></head>
+      <body>
+        <h1>Data Limit Exceeded</h1>
+        <p>You have used ${user.dataUsed.toFixed(2)} MB out of ${limit} MB.</p>
+        <p>Please reset your usage or contact admin.</p>
+        <a href="/console">Go to Console</a>
+      </body>
+      </html>
+    `);
+  }
 
   try {
     const response = await fetch(url, {
